@@ -136,7 +136,9 @@ class jobmonitor():
                         update.append((status, row['ID']))
                         proc_status = "SUCCESS"
                         if self.onSuccess:
-                            self.onSuccess(self.config, row)
+                            query = self.onSuccess(self.config, row)
+                            if query:
+                                self.dbcur.execute(query['sql'], query['args'])
                     else:
                         outf = open(outfile, 'a')
                         out = proc.communicate()[0]
