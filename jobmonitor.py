@@ -33,6 +33,8 @@ class jobmonitor():
             mylib.usage(self.args)
             sys.exit()
 
+        self.onSuccess = None
+
         config = mylib.readConfigFile(os.getenv("HOME") + "/.jobmonitor.cfg")
         config.update(mylib.readConfigFile(cla["configfile"]))
 
@@ -133,6 +135,8 @@ class jobmonitor():
                         status = (row['status'] | self.config['flag_success']) & ~self.config['flag_marked'] & ~PROCESSING
                         update.append((status, row['ID']))
                         proc_status = "SUCCESS"
+                        if self.onSuccess:
+                            self.onSuccess(self.config, row)
                     else:
                         outf = open(outfile, 'a')
                         out = proc.communicate()[0]
