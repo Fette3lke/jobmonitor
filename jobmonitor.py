@@ -6,9 +6,11 @@ import time
 import math
 import re
 import logging
+import shutil
+import numpy as np
 from subprocess import *
 
-# common flags
+# non-user flags
 PROCESSING = 1 << 30
 ERROR = 1 << 31
 BUSY = (PROCESSING | ERROR)
@@ -21,9 +23,9 @@ class jobmonitor():
             ["cfg", "configfile", cfg, "<configuration file to load>"],
             ["p", "prefix", True, "<simulation prefix>"],
             ["w", "walltime",True, "<Wallclock time>"],
-            ["n", "max_ic_procs", True],
             ["l", "logfile", True],
-            ["lvl", "loglvl", True]
+            ["lvl", "loglvl", True],
+            ["h", "hostfile", True,"<file containing hostnames>"]
             ]
         if not args == None:
             self.args.extend(args)
@@ -46,23 +48,24 @@ class jobmonitor():
 
         # default values for obligatory parameters, if set to None the parameter has to be set in the configfile or command line arguments
         self.defaults = [["username", os.getenv("USER")],
-                         ["mpi_threads", 1],
                     #            ["scriptdir", None],
                          ["scriptname", None],
                          ["database", None],
                     #            ["parampath", None],
                          ["outputpath", None],
                          ["prefix", ""],
-                         ["max_ic_procs", 1],
                          ["walltime", None],
-                         ["refinetime", 900],
+                         ["runtime", 900],
                          ["polltime", 60],
                          ["table", None],
                          ["namecolumn", "ID"],
                          ["flag_marked", 1],
                          ["flag_success", 2],
                          ["logfile", "./log.txt"],
-                         ["loglvl", "WARNING"]                       
+                         ["loglvl", "WARNING"],
+                         ["hostfile", None],
+                         ["scheduler", "SGE"],
+                         ["remote", True]
 #                    ["ic_resolution", None]
                     #            ["",None]
                     ]
@@ -97,6 +100,14 @@ class jobmonitor():
         self.config = config
         self.db = db
 
+        nodes = []
+        with open(config['hostfile'], 'r') as f:
+            for line in f:
+                nodes.append((line.rstrip(), False))
+        self.nodes = np.array(nodes, dtype = np.dtype([('name', np.str_, 256), ('used', np.bool_)]))
+        if not self.config['remote'] and len(self.nodes) > 1:
+            self.nodes[0]['used'] = True
+
     def test(self):
         for key in self.config:
             os.environ['JM_'+key.upper()] = str(self.config[key])
@@ -107,21 +118,29 @@ class jobmonitor():
 
     def loop(self):
         # Select halos that are marked and start to create ICs for them -> flag PROCESSING
-        limit = math.floor(self.config['max_ic_procs'] / (self.config['mpi_threads']))
+        Procs = []
+        procsUsedRefine = 0
+        nodesUsed = 0
+        unused, = np.where(self.nodes['used'] == False)
+        nnodes = len(self.nodes[unused])
+        limit = nnodes
         if limit < 1:
             limit = 1
-        refineProcs = []
-        procsUsedRefine = 0
+        
         for key in self.config:
             os.environ['JM_'+key.upper()] = str(self.config[key])
 
-        # main loop, creating and observing jobs
+        node = 0
+############################################################################
+# main loop, creating and monitoring jobs
+############################################################################
         while 1:
             update = []
 
-            # poll jobs, check whether they have finished, update database accordingly
-            for proc, row in refineProcs[:]:
-        #        output, err = proc.communicate()
+############################################################################
+# poll jobs, check whether they have finished, update database accordingly #
+############################################################################
+            for proc, row, nodelist in Procs[:]:
                 if proc.poll() is not None:
                     outdir = "%s/%s%d" % (self.config['outputpath'], self.config['prefix'], row[self.config['namecolumn']])
                     tmpdir = "%s/tmp" % (outdir)
@@ -129,14 +148,14 @@ class jobmonitor():
                     outf = open(outfile, 'r')
                     output = outf.readlines()
                     outf.close()                    
-                    # script to generate ICs should finish with string 'SUCCESS'
+                    # scripts should finish with string 'SUCCESS' in $JM_OUTFILE
                     proc_status = "FAIL"
                     if re.search("SUCCESS", output[-1]) is not None:
                         status = (row['status'] | self.config['flag_success']) & ~self.config['flag_marked'] & ~PROCESSING
                         update.append((status, row['ID']))
                         proc_status = "SUCCESS"
                         if self.onSuccess:
-                            query = self.onSuccess(self.config, row)
+                            query = self.onSuccess(output[-1], self.config, row)
                             if query:
                                 self.dbcur.execute(query['sql'], query['args'])
                     else:
@@ -144,41 +163,104 @@ class jobmonitor():
                         out = proc.communicate()[0]
                         outf.write(out)
                         outf.close()
+                        status = (row['status'] | ERROR) & ~self.config['flag_marked'] & ~PROCESSING
+                        update.append((status, row['ID']))
 
-                    procsUsedRefine -= (self.config['mpi_threads'])
-                    refineProcs.remove((proc, row))
-                    self.logger.info("process %s finished with status %s | procsUsed %d", self.config['prefix']+str(row[self.config['namecolumn']]), proc_status, procsUsedRefine)
 
-            if ((time.time() - self.config['startup']) < (self.config['walltime'] - self.config['refinetime'])):
-                query = self.dbcur.execute("SELECT * FROM {0} WHERE status=:marked AND NOT status & :busy LIMIT :limit".format(self.config['table']), {"limit": limit, "marked": self.config['flag_marked'], "busy": BUSY})
-#                self.logger.debug("time passed: %d | max time: %d", (time.time() - self.config['startup']), (self.config['walltime'] - self.config['refinetime'])) 
+                    nodesUsed -= len(nodelist)
+                    for node in nodelist:
+                        self.nodes[node]['used'] = False
+                    Procs.remove((proc, row, nodelist))
+                    self.logger.info("process %s finished with status %s | nodesUsed %d", 
+                                     self.config['prefix']+str(row[self.config['namecolumn']]), 
+                                     proc_status, nodesUsed)
 
-                # start new jobs
+############################################################################
+# query database for jobs to start
+# no jobs will be started if the leftover walltime is less than runtime
+############################################################################
+            if ((time.time() - self.config['startup']) < (self.config['walltime'] - self.config['runtime'])):
+                if self.config.has_key('order'):
+                    order = "ORDER BY %s" % self.config['order']
+                else:
+                    order = ""
+                query = self.dbcur.execute("SELECT * FROM {0} WHERE status=:marked AND NOT status & :busy LIMIT :limit {1}"
+                                           .format(self.config['table'], order), 
+                                           {"limit": limit, "marked": self.config['flag_marked'], 
+                                            "busy": BUSY})
+
+                # start new jobs if enough unused nodes are available
                 for row in query:
-                    if procsUsedRefine + self.config['mpi_threads'] > self.config['max_ic_procs']:
+                    unused, = np.where(self.nodes['used'] == False)
+                    if len(unused) == 0:
                         break
+                    nodename = self.nodes[ unused[0] ]['name']
+                    if 'nodes' in  row.keys():
+                        if nodesUsed + row['nodes'] > nnodes:
+                            continue
+                        nodelist = unused[:row['nodes']]
+                        if len(nodelist) < row['nodes']:
+                            break
+                    else:
+                        if nodesUsed >= nnodes:
+                            break                        
+                        nodelist = np.array([unused[0]])                    
+                    #sys.stdout.flush()
+                    # create directories, copy files
                     outdir = "%s/%s%d" % (self.config['outputpath'], self.config['prefix'], row[self.config['namecolumn']])
                     tmpdir = "%s/tmp" % (outdir)
+                    outfile = "%s/%s%d%s" % (tmpdir, self.config['prefix'], row[self.config['namecolumn']], ".out")
                     mylib.mkdirs(tmpdir)
-                    refineProcs.append((Popen([self.config['scriptname'], str(row[self.config['namecolumn']])], cwd=outdir, stdout=PIPE, stderr=STDOUT), row))
+                    scriptname = os.path.basename(self.config['scriptname'])
+                    scriptname = os.path.join(outdir, scriptname)
+                    shutil.copyfile(self.config['scriptname'], scriptname)
+                    shutil.copymode(self.config['scriptname'], scriptname)
+
+                    # create hostfile for this job
+                    hostfile = os.path.join(outdir, 'hostfile')
+                    with open(hostfile, 'w') as hf:
+                        for node in nodelist:
+                            hf.write('%s\n' % self.nodes[node]['name'])
+
+                    # create file to pass variables to job-script
+                    # job-script should source 'exports.sh'
+                    exportfile = os.path.join(outdir, 'exports.sh')
+                    with open(exportfile, 'w') as ef:
+                        ef.write('#!/bin/bash\n')
+                        for key in self.config:
+                            ef.write('export %s=%s\n' % ('JM_'+key.upper(), self.config[key]))
+                        ef.write('export %s=%s\n' % ('JM_OUTFILE', outfile) )
+                        ef.write('export %s=%s\n' % ('JM_HOSTFILE', hostfile) )
+                        ef.write('#%s | %s\n' % (nodename, scriptname))
+                    if self.config['remote']:
+                        cmd = ["mpirun", "-genvnone", "-np", "1", "--host", nodename, scriptname, str(row[self.config['namecolumn']])]
+                    else:
+                        cmd = [scriptname, str(row[self.config['namecolumn']])]
+
+                    # invoke script (on remote node if config['remote'] is set) and store process in dictionary, mark nodes as in use
+                    Procs.append((Popen(cmd, cwd=outdir, stdout=PIPE, stderr=STDOUT, shell=False), row, nodelist))
+                    for node in nodelist:
+                        self.nodes[node]['used'] = True
                     status = row['status'] | PROCESSING
                     update.append((status, row['ID']))
-                    procsUsedRefine += self.config['mpi_threads']
+                    nodesUsed += len(nodelist)
                     self.logger.info("process started %s", self.config['prefix']+str(row[self.config['namecolumn']]))
 
+            # update database if status of a job changed
             if update:
                 self.dbcur.executemany("UPDATE {0} SET STATUS=? WHERE ID=?".format(self.config['table']), update)
                 self.db.commit()
                 update = []
 
-            if len(refineProcs) > 0:
-                self.logger.debug("processes: %d | procs used %d", len(refineProcs), procsUsedRefine)
+            # stop if no processes are left in the monitor list
+            if len(Procs) > 0:
+                self.logger.debug("processes: %d | nodes used %d", len(Procs), nodesUsed)
                 time.sleep(self.config['polltime'])
             else:
                 break
 
-        # mark all halos that are still processing as erroneous
+        # mark all halos that are still processing as erroneous (commented out for now, will think of better detection of failed processes)
         self.logger.debug('main loop finished')
-        self.dbcur.execute("UPDATE {0} SET status = status | ? WHERE status & ? and status & ?".format(self.config['table']), (ERROR, self.config['flag_marked'], PROCESSING))
+#        self.dbcur.execute("UPDATE {0} SET status = status | ? WHERE status & ? and status & ?".format(self.config['table']), (ERROR, self.config['flag_marked'], PROCESSING))
         self.db.commit
         return 0
