@@ -15,13 +15,43 @@ PROCESSING = 1 << 30
 ERROR = 1 << 31
 BUSY = (PROCESSING | ERROR)
 
-class jobmonitor():
+class myProcess(Popen):
+    """
+    class to keep track of subprocess information
+    """
+    def __init__(self, *args, **kwargs):
+        self.nodelist = kwargs.pop("nodelist", None)
+        self.info      = kwargs.pop("info", None)
+        self.status   = kwargs.pop("status", 0)
+        self.outfile  = kwargs.pop("outfile", None)
+        self.cwd      = kwargs.get("cwd", None)
+        super(myProcess, self).__init__(*args, **kwargs)
+
+    def isRunning(self):
+        if self.poll() is None:
+            self.status |= 1
+            return True
+        self.status &= ~1
+        return False
+
+    def isAborting(self):
+        if self.status & 2:
+            return True
+        return False
+
+class jobmonitor(object):
+    """
+    spawns jobs (remotely) and keeps track of their status
+    database is updated accordingly
+    manages available ressources
+    """
     def __init__(self, args=None, defaults=None, cfg="./jobmonitor.cfg"):
     # possible command line arguments [shortcut, name, default value (False for simple 0/1 flag), description]
         self.args = [
             ["db", "database", True, "<sqlite3 database file name>"],
             ["cfg", "configfile", cfg, "<configuration file to load>"],
             ["p", "prefix", True, "<simulation prefix>"],
+            ["t", "polltime", True, "<polltime to check running processes in seconds>"],
             ["w", "walltime",True, "<Wallclock time>"],
             ["l", "logfile", True],
             ["lvl", "loglvl", True],
@@ -35,7 +65,11 @@ class jobmonitor():
             mylib.usage(self.args)
             sys.exit()
 
+        # possible user-defined event handlers
         self.onSuccess = None
+        self.onFail    = None
+        self.onSubmit  = None
+        self.onAbort   = None
 
         config = mylib.readConfigFile(os.getenv("HOME") + "/.jobmonitor.cfg")
         config.update(mylib.readConfigFile(cla["configfile"]))
@@ -50,22 +84,25 @@ class jobmonitor():
         self.defaults = [["username", os.getenv("USER")],
                     #            ["scriptdir", None],
                          ["scriptname", None],
+                         ["abortscript", False],
                          ["database", None],
                     #            ["parampath", None],
                          ["outputpath", None],
+                         ["subdir", ""],
                          ["prefix", ""],
                          ["walltime", None],
                          ["runtime", 900],
                          ["polltime", 60],
                          ["table", None],
                          ["namecolumn", "ID"],
+                         ["nodecolumn", "nodes"],
                          ["flag_marked", 1],
                          ["flag_success", 2],
                          ["logfile", "./log.txt"],
                          ["loglvl", "WARNING"],
                          ["hostfile", None],
                          ["scheduler", "SGE"],
-                         ["remote", True]
+                         ["remote", False]
 #                    ["ic_resolution", None]
                     #            ["",None]
                     ]
@@ -80,12 +117,12 @@ class jobmonitor():
 
         config["startup"] = time.time()
         logging.basicConfig(format='%(asctime)s|%(levelname)s\t%(message)s', datefmt='%m/%d/%Y %H:%M:%S ',filename=config['logfile'], filemode='w')
-        self.logger = logging.getLogger('create-ics')
+        self.logger = logging.getLogger('jobmonitor')
         self.logger.setLevel(eval("logging."+config['loglvl']))
 
         self.logger.debug('started')
 
-        # read the simulation-database
+        # read the database
         db = mysqlite.db_init(config["database"])
         if not db:
             print >> sys.stderr, "database %s cannot be opened" % config["database"]
@@ -100,12 +137,13 @@ class jobmonitor():
         self.config = config
         self.db = db
 
+        # read nodefile and store in array to keep track which ones are in use
         nodes = []
         with open(config['hostfile'], 'r') as f:
             for line in f:
                 nodes.append((line.rstrip(), False))
         self.nodes = np.array(nodes, dtype = np.dtype([('name', np.str_, 256), ('used', np.bool_)]))
-        if not self.config['remote'] and len(self.nodes) > 1:
+        if self.config['remote'] and len(self.nodes) > 1:
             self.nodes[0]['used'] = True
 
     def test(self):
@@ -115,11 +153,28 @@ class jobmonitor():
         print self.config['scriptname']
         Popen([self.config['scriptname'], str('testing123')], stdout=outf, stderr=STDOUT)
         outf.close()
+        
+    def callEvent(self, func, msg=None, info=None):
+        """
+        call Event handlers and call sql query if needed
+        """
+        if func:
+            query = self.func(msg, self.config, info)
+            if query:
+                self.dbcur.execute(query['sql'], query['args'])
+
+
+    def start(self):
+        """
+        alias for jobmonitor.loop()
+        """
+        return self.loop()
 
     def loop(self):
-        # Select halos that are marked and start to create ICs for them -> flag PROCESSING
+        """
+        enter main monitoring loop, jobs will be submitted here
+        """
         Procs = []
-        procsUsedRefine = 0
         nodesUsed = 0
         unused, = np.where(self.nodes['used'] == False)
         nnodes = len(self.nodes[unused])
@@ -140,44 +195,52 @@ class jobmonitor():
 ############################################################################
 # poll jobs, check whether they have finished, update database accordingly #
 ############################################################################
-            for proc, row, nodelist in Procs[:]:
-                if proc.poll() is not None:
-                    outdir = "%s/%s%d" % (self.config['outputpath'], self.config['prefix'], row[self.config['namecolumn']])
-                    tmpdir = "%s/tmp" % (outdir)
-                    outfile = "%s/%s%d%s" % (tmpdir, self.config['prefix'], row[self.config['namecolumn']], ".out")
-                    outf = open(outfile, 'r')
-                    output = outf.readlines()
-                    outf.close()                    
-                    # scripts should finish with string 'SUCCESS' in $JM_OUTFILE
-                    proc_status = "FAIL"
-                    if re.search("SUCCESS", output[-1]) is not None:
-                        status = (row['status'] | self.config['flag_success']) & ~self.config['flag_marked'] & ~PROCESSING
-                        update.append((status, row['ID']))
-                        proc_status = "SUCCESS"
-                        if self.onSuccess:
-                            query = self.onSuccess(output[-1], self.config, row)
-                            if query:
-                                self.dbcur.execute(query['sql'], query['args'])
+            for process in Procs[:]:
+                if not process.isRunning():
+                    status = process.info['status']
+                    if process.isAborting():
+                        status = (process.info['status']) & ~PROCESSING
+                        self.logger.info("process %s aborted", self.config['prefix']+str(process.info[self.config['namecolumn']]) )
+                        self.callEvent(self.onAbort, info=process.info)
                     else:
-                        outf = open(outfile, 'a')
-                        out = proc.communicate()[0]
-                        outf.write(out)
-                        outf.close()
-                        status = (row['status'] | ERROR) & ~self.config['flag_marked'] & ~PROCESSING
-                        update.append((status, row['ID']))
+#                        outdir = "%s/%s%d/%s" % (self.config['outputpath'], self.config['prefix'], process.info[self.config['namecolumn']], self.config['subdir'])
+                        outdir = process.cwd
+                        tmpdir = "%s/tmp" % (outdir)
+#                        outfile = "%s/%s%d%s" % (tmpdir, self.config['prefix'], process.info[self.config['namecolumn']], ".out")
+                        outfile = process.outfile
+                        outf = open(outfile, 'r')
+                        output = outf.readlines()
+                        outf.close()                    
+                        # scripts should finish with string 'SUCCESS' in $JM_OUTFILE
+                        proc_status = "FAIL"
+                        if re.search("SUCCESS", output[-1]) is not None:
+                            # set flag for success, remove flag for marked and processing
+                            status = (process.info['status'] | self.config['flag_success']) & ~self.config['flag_marked'] & ~PROCESSING
+                            proc_status = "SUCCESS"
+                            self.callEvent(self.onSuccess, msg=output[-1], info=process.info)
+                        else:
+                            outf = open(outfile, 'a')
+                            out = process.communicate()[0]
+                            if out:
+                                outf.write(out)
+                            outf.close()
+                            status = (process.info['status'] | ERROR) & ~self.config['flag_marked'] & ~PROCESSING
+                            self.callEvent(self.onFail, msg=output[-1], info=process.info)
 
-
-                    nodesUsed -= len(nodelist)
-                    for node in nodelist:
+                        self.logger.info("process %s finished with status %s | nodesUsed %d", 
+                                         self.config['prefix']+str(process.info[self.config['namecolumn']]), 
+                                         proc_status, nodesUsed)
+                        
+                    update.append((status, process.info['ID']))
+                    nodesUsed -= len(process.nodelist)
+                    for node in process.nodelist:
                         self.nodes[node]['used'] = False
-                    Procs.remove((proc, row, nodelist))
-                    self.logger.info("process %s finished with status %s | nodesUsed %d", 
-                                     self.config['prefix']+str(row[self.config['namecolumn']]), 
-                                     proc_status, nodesUsed)
+                    Procs.remove(process)
 
 ############################################################################
 # query database for jobs to start
 # no jobs will be started if the leftover walltime is less than runtime
+# (processes will be aborted instead if abortscript is specified)
 ############################################################################
             if ((time.time() - self.config['startup']) < (self.config['walltime'] - self.config['runtime'])):
                 if self.config.has_key('order'):
@@ -195,19 +258,19 @@ class jobmonitor():
                     if len(unused) == 0:
                         break
                     nodename = self.nodes[ unused[0] ]['name']
-                    if 'nodes' in  row.keys():
-                        if nodesUsed + row['nodes'] > nnodes:
+                    if self.config['nodecolumn'] in  row.keys():
+                        if nodesUsed + row[self.config['nodecolumn']] > nnodes:
                             continue
-                        nodelist = unused[:row['nodes']]
-                        if len(nodelist) < row['nodes']:
+                        nodelist = unused[:row[self.config['nodecolumn']]]
+                        if len(nodelist) < row[self.config['nodecolumn']]:
                             break
                     else:
                         if nodesUsed >= nnodes:
                             break                        
                         nodelist = np.array([unused[0]])                    
-                    #sys.stdout.flush()
+
                     # create directories, copy files
-                    outdir = "%s/%s%d" % (self.config['outputpath'], self.config['prefix'], row[self.config['namecolumn']])
+                    outdir = "%s/%s%d/%s" % (self.config['outputpath'], self.config['prefix'], row[self.config['namecolumn']], self.config['subdir'])
                     tmpdir = "%s/tmp" % (outdir)
                     outfile = "%s/%s%d%s" % (tmpdir, self.config['prefix'], row[self.config['namecolumn']], ".out")
                     mylib.mkdirs(tmpdir)
@@ -215,6 +278,11 @@ class jobmonitor():
                     scriptname = os.path.join(outdir, scriptname)
                     shutil.copyfile(self.config['scriptname'], scriptname)
                     shutil.copymode(self.config['scriptname'], scriptname)
+                    if self.config['abortscript']:
+                        abortscriptname = os.path.basename(self.config['abortscript'])
+                        abortscriptname = os.path.join(outdir, abortscriptname)
+                        shutil.copyfile(self.config['abortscript'], abortscriptname)
+                        shutil.copymode(self.config['abortscript'], abortscriptname)                        
 
                     # create hostfile for this job
                     hostfile = os.path.join(outdir, 'hostfile')
@@ -230,21 +298,42 @@ class jobmonitor():
                         for key in self.config:
                             ef.write('export %s=%s\n' % ('JM_'+key.upper(), self.config[key]))
                         ef.write('export %s=%s\n' % ('JM_OUTFILE', outfile) )
-                        ef.write('export %s=%s\n' % ('JM_HOSTFILE', hostfile) )
+                        ef.write('export %s=%s\n' % ('JM_NODES', hostfile) )
                         ef.write('#%s | %s\n' % (nodename, scriptname))
                     if self.config['remote']:
-                        cmd = ["mpirun", "-genvnone", "-np", "1", "--host", nodename, scriptname, str(row[self.config['namecolumn']])]
+                        if self.config['remote'] == "mpirun":
+                            cmd = ["mpirun", "-np", "1", "--host", nodename, scriptname, str(row[self.config['namecolumn']])]
+                        elif self.config['remote'] == "aprun":
+                            cmd = ["aprun", "-n", "1", "-N", "1", "-m", "32G", "-L", nodename, scriptname, str(row[self.config['namecolumn']])]
+                        else:
+                            print "unknown remote command! supported are 'mpirun' and 'aprun'"
+                            sys.exit()
                     else:
                         cmd = [scriptname, str(row[self.config['namecolumn']])]
 
                     # invoke script (on remote node if config['remote'] is set) and store process in dictionary, mark nodes as in use
-                    Procs.append((Popen(cmd, cwd=outdir, stdout=PIPE, stderr=STDOUT, shell=False), row, nodelist))
+                    # if remote is not set (or False) the job-script should use the generated hostfile ($JM_NODES)
+                    # and call the parallel environment itself
+
+#                    Procs.append((Popen(cmd, cwd=outdir, stdout=PIPE, stderr=STDOUT, shell=False), row, nodelist))
+                    Procs.append( myProcess(cmd, cwd=outdir, stderr=STDOUT, shell=False, info=row, nodelist=nodelist, status=1, outfile=outfile) )
+                    self.callEvent(self.onSubmit, info=row)
+#                    Procs.append((Popen(cmd, cwd=outdir, stderr=STDOUT, shell=False), row, nodelist))
                     for node in nodelist:
                         self.nodes[node]['used'] = True
                     status = row['status'] | PROCESSING
                     update.append((status, row['ID']))
                     nodesUsed += len(nodelist)
                     self.logger.info("process started %s", self.config['prefix']+str(row[self.config['namecolumn']]))
+
+            # leftover walltime is less than runtime -> abort processes
+            elif self.config['abortscript']:
+                for process in Procs:
+                    process.status |= 2
+                    abortscriptname = os.path.basename(self.config['abortscript'])
+                    abortscriptname = os.path.join(process.cwd, abortscriptname)
+                    Popen([abortscriptname, str(row[self.config['namecolumn']])], cwd=process.cwd)
+                    self.logger.info("sent abort to process %s", self.config['prefix']+str(row[self.config['namecolumn']]))
 
             # update database if status of a job changed
             if update:
