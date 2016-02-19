@@ -21,7 +21,7 @@ class myProcess(Popen):
     """
     def __init__(self, *args, **kwargs):
         self.nodelist = kwargs.pop("nodelist", None)
-        self.info      = kwargs.pop("info", None)
+        self.info     = kwargs.pop("info", None)
         self.status   = kwargs.pop("status", 0)
         self.outfile  = kwargs.pop("outfile", None)
         self.cwd      = kwargs.get("cwd", None)
@@ -159,7 +159,7 @@ class jobmonitor(object):
         call Event handlers and call sql query if needed
         """
         if func:
-            query = self.func(msg, self.config, info)
+            query = func(msg, self.config, info)
             if query:
                 self.dbcur.execute(query['sql'], query['args'])
 
@@ -258,13 +258,16 @@ class jobmonitor(object):
                     if len(unused) == 0:
                         break
                     nodename = self.nodes[ unused[0] ]['name']
-                    if self.config['nodecolumn'] in  row.keys():
-                        if nodesUsed + row[self.config['nodecolumn']] > nnodes:
+                    try:
+                        numnodes = row[self.config['nodecolumn']]
+                        #if self.config['nodecolumn'] in  row.keys():
+                        if nodesUsed + numnodes > nnodes:
                             continue
-                        nodelist = unused[:row[self.config['nodecolumn']]]
-                        if len(nodelist) < row[self.config['nodecolumn']]:
+                        nodelist = unused[:numnodes]
+                        if len(nodelist) < numnodes:
                             break
-                    else:
+                    except IndexError:
+                        #else:
                         if nodesUsed >= nnodes:
                             break                        
                         nodelist = np.array([unused[0]])                    
@@ -299,6 +302,7 @@ class jobmonitor(object):
                             ef.write('export %s=%s\n' % ('JM_'+key.upper(), self.config[key]))
                         ef.write('export %s=%s\n' % ('JM_OUTFILE', outfile) )
                         ef.write('export %s=%s\n' % ('JM_NODES', hostfile) )
+                        ef.write('export %s=%d\n' % ('JM_NUMNODES', len(nodelist)) )
                         ef.write('#%s | %s\n' % (nodename, scriptname))
                     if self.config['remote']:
                         if self.config['remote'] == "mpirun":
@@ -324,7 +328,7 @@ class jobmonitor(object):
                     status = row['status'] | PROCESSING
                     update.append((status, row['ID']))
                     nodesUsed += len(nodelist)
-                    self.logger.info("process started %s", self.config['prefix']+str(row[self.config['namecolumn']]))
+                    self.logger.info("process started %s on %d nodes", self.config['prefix']+str(row[self.config['namecolumn']]), len(nodelist) )
 
             # leftover walltime is less than runtime -> abort processes
             elif self.config['abortscript']:
@@ -333,7 +337,7 @@ class jobmonitor(object):
                     abortscriptname = os.path.basename(self.config['abortscript'])
                     abortscriptname = os.path.join(process.cwd, abortscriptname)
                     Popen([abortscriptname, str(row[self.config['namecolumn']])], cwd=process.cwd)
-                    self.logger.info("sent abort to process %s", self.config['prefix']+str(row[self.config['namecolumn']]))
+                    self.logger.info("sent abort to process %s", self.config['prefix']+str(process.info[self.config['namecolumn']]))
 
             # update database if status of a job changed
             if update:
